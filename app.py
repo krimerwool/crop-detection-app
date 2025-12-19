@@ -4,7 +4,7 @@ import numpy as np
 from PIL import Image, ImageOps
 
 
-MODEL_PATH = 'crop_classifier_finetuned.tflite'
+MODEL_PATH = 'crop_classifier_hybrid_finetuned'
 LABELS = {0: 'Maize', 1: 'Mustard', 2: 'Wheat'}
 
 @st.cache_resource
@@ -59,3 +59,4 @@ if uploaded_file is not None:
     st.write("Detailed Analysis:")
 
     st.bar_chart({label: float(predictions[idx]) for idx, label in LABELS.items()})
+
