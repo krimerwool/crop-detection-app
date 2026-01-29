@@ -1,229 +1,333 @@
 import streamlit as st
 import tensorflow as tf
 import numpy as np
+import cv2
+from PIL import Image, ImageDraw, ImageFont
 import pandas as pd
-from PIL import Image, ImageOps
+from collections import defaultdict
 
+# =====================================================
+# CONFIG
+# =====================================================
+MODEL_CROP = "final_model.tflite"
+MODEL_BARREN = "barren_vs_crop_model_v2.tflite"
 
-MODEL_PATH_BARREN = 'barren_vs_crop_model.tflite'
-MODEL_PATH_MAIN = 'crop_classifier_5crops_v1.tflite'
-MODEL_PATH_MAIZE = 'maize_stage_classifier.tflite'
-MODEL_PATH_WHEAT = 'wheat_stage_classifier (1).tflite' 
+CROP_SIZE = 260
+BARREN_SIZE = 224
 
-LABELS_5_CROPS = {0: 'Maize', 1: 'Mustard', 2: 'Rice', 3: 'Sugarcane', 4: 'Wheat'}
-LABELS_MAIZE_STAGE = {0: 'Maturity', 1: 'Reproductive', 2: 'Seedling', 3: 'Vegetative'}
-LABELS_WHEAT_STAGE = {0: 'Flowering', 1: 'Jointing', 2: 'Ripening', 3: 'Seedling'}
+GRID_SIZE = 3
 
-AGE_ESTIMATES = {
-    'Maize': {
-        'Seedling': '0 - 2 Weeks', 'Vegetative': '3 - 7 Weeks',
-        'Reproductive': '8 - 10 Weeks', 'Maturity': '11 - 15+ Weeks'
-    },
-    'Wheat': {
-        'Seedling': '1 - 3 Weeks', 'Jointing': '4 - 6 Weeks',
-        'Flowering': '7 - 9 Weeks', 'Ripening': '10 - 14+ Weeks'
-    }
+CONF_THRESH = 0.65
+VOTE_THRESH = 3
+
+LABELS = {
+    0: "Maize",
+    1: "Rice",
+    2: "Soybean",
+    3: "Sugarcane"
 }
 
+COLORS = {
+    "Rice": "cyan",
+    "Sugarcane": "orange",
+    "Maize": "yellow",
+    "Soybean": "lightgreen",
+    "Barren": "red"
+}
+
+# =====================================================
+# LOAD MODELS
+# =====================================================
 @st.cache_resource
-def load_all_models():
-    """Loads all TFLite models into memory once."""
-    interpreters = {}
-    model_map = {
-        'barren': MODEL_PATH_BARREN,
-        'main': MODEL_PATH_MAIN,
-        'maize': MODEL_PATH_MAIZE,
-        'wheat': MODEL_PATH_WHEAT
+def load_models():
+    crop = tf.lite.Interpreter(model_path=MODEL_CROP)
+    crop.allocate_tensors()
+
+    barren = tf.lite.Interpreter(model_path=MODEL_BARREN)
+    barren.allocate_tensors()
+
+    return crop, barren
+
+crop_interp, barren_interp = load_models()
+
+crop_in = crop_interp.get_input_details()
+crop_out = crop_interp.get_output_details()
+barren_in = barren_interp.get_input_details()
+barren_out = barren_interp.get_output_details()
+
+# =====================================================
+# PREPROCESSING
+# =====================================================
+def preprocess_barren(img):
+    img = cv2.resize(img, (BARREN_SIZE, BARREN_SIZE))
+    img = img.astype(np.float32)
+    return np.expand_dims(img, 0)
+
+def preprocess_crop(img):
+    img = cv2.resize(img, (CROP_SIZE, CROP_SIZE))
+    img = img.astype(np.float32)
+    return np.expand_dims(img, 0)
+
+# =====================================================
+# SKY DETECTION
+# =====================================================
+def is_sky_or_background(region, threshold=0.4):
+    hsv = cv2.cvtColor(region, cv2.COLOR_RGB2HSV)
+    top = hsv[: int(region.shape[0] * 0.4), :]
+
+    blue = cv2.inRange(top, (90, 50, 100), (130, 255, 255))
+    gray = cv2.inRange(top, (0, 0, 180), (180, 50, 255))
+
+    mask = cv2.bitwise_or(blue, gray)
+    if mask.size == 0:
+        return False
+
+    return (np.count_nonzero(mask) / mask.size) > threshold
+
+# =====================================================
+# FULL IMAGE PASS
+# =====================================================
+def classify_full_image(image):
+    """
+    Pass 1:
+    - Run barren vs crop model on entire image
+    - If non-barren, run crop classifier
+    """
+
+    # ---- BARREN MODEL ----
+    barren_interp.set_tensor(
+        barren_in[0]["index"],
+        preprocess_barren(image)
+    )
+    barren_interp.invoke()
+
+    prob_crop = barren_interp.get_tensor(
+        barren_out[0]["index"]
+    )[0][0]
+
+    barren_result = {
+        "is_crop": prob_crop > 0.5,
+        "confidence": float(prob_crop if prob_crop > 0.5 else 1 - prob_crop)
     }
 
-    for key, path in model_map.items():
-        try:
-            interpreter = tf.lite.Interpreter(model_path=path)
-            interpreter.allocate_tensors()
-            interpreters[key] = interpreter
-        except Exception as e:
-            st.error(f"Error loading {key} model ({path}): {e}")
-            interpreters[key] = None
-    return interpreters
+    # # If barren → stop here
+    # if prob_crop <= 0.5:
+    #     return barren_result, None
 
-def predict_with_interpreter(interpreter, image, is_binary=False, normalize=True):
-    """
-    Runs inference.
-    normalize=True  -> (img / 255.0) -> Range 0.0 to 1.0 (For Crop/Stage models)
-    normalize=False -> (img)         -> Range 0.0 to 255.0 (For Barren model)
-    """
-    if interpreter is None:
+    # ---- CROP MODEL ----
+    crop_interp.set_tensor(
+        crop_in[0]["index"],
+        preprocess_crop(image)
+    )
+    crop_interp.invoke()
+
+    probs = crop_interp.get_tensor(
+        crop_out[0]["index"]
+    )[0]
+
+    idx = int(np.argmax(probs))
+
+    full_crop = {
+        "crop": LABELS[idx],
+        "confidence": float(probs[idx]),
+        "all_probs": probs.tolist()
+    }
+
+    return barren_result, full_crop
+
+# =====================================================
+# REGION CLASSIFICATION
+# =====================================================
+def classify_region(region):
+    barren_interp.set_tensor(barren_in[0]["index"], preprocess_barren(region))
+    barren_interp.invoke()
+
+    prob_crop = barren_interp.get_tensor(barren_out[0]["index"])[0][0]
+
+    if prob_crop <= 0.5:
         return None
 
-    input_details = interpreter.get_input_details()
-    output_details = interpreter.get_output_details()
+    crop_interp.set_tensor(crop_in[0]["index"], preprocess_crop(region))
+    crop_interp.invoke()
+    probs = crop_interp.get_tensor(crop_out[0]["index"])[0]
 
-    size = (224, 224)
-    image = ImageOps.fit(image, size, Image.Resampling.LANCZOS)
-    img_array = np.asarray(image)
+    idx = int(np.argmax(probs))
+    return LABELS[idx], float(probs[idx])
 
-    img_array = img_array.astype(np.float32)
-    
-    if normalize:
-        input_data = img_array / 255.0
-    else:
-        input_data = img_array
-        
-    data = np.expand_dims(input_data, axis=0)
+# =====================================================
+# GRID PASS
+# =====================================================
+def run_grid(image, ox=0.0, oy=0.0):
+    h, w = image.shape[:2]
+    ch, cw = h // GRID_SIZE, w // GRID_SIZE
 
-    interpreter.set_tensor(input_details[0]['index'], data)
-    interpreter.invoke()
-    
-    # Result
-    prediction = interpreter.get_tensor(output_details[0]['index'])
-    
-    if is_binary:
-        return prediction[0][0] 
-    else:
-        return prediction[0]   
+    detections = []
 
-# UI SETUP
+    for r in range(GRID_SIZE):
+        for c in range(GRID_SIZE):
+            y1 = int(r * ch + oy * ch)
+            y2 = y1 + ch
+            x1 = int(c * cw + ox * cw)
+            x2 = x1 + cw
 
-st.set_page_config(page_title="Crop-Detector-Demo", page_icon="🌾", layout="wide")
+            if y2 > h or x2 > w:
+                continue
 
-mode = st.sidebar.radio("Select Mode:", ["Single Image Analysis", "Batch Processing (Bulk)"])
-models = load_all_models()
+            region = image[y1:y2, x1:x2]
 
+            if region.shape[0] < 60 or region.shape[1] < 60:
+                continue
 
-if mode == "Single Image Analysis":
-    st.title("Crop-Detector-Demo")
-    st.markdown("**Workflow:** Barren Check → Crop ID → Growth Stage")
-    
-    uploaded_file = st.file_uploader("Choose an image...", type=["jpg", "png", "jpeg"])
+            if is_sky_or_background(region):
+                continue
 
-    if uploaded_file is not None:
-        image = Image.open(uploaded_file).convert('RGB')
-        col1, col2 = st.columns([1, 2])
-        
-        with col1:
-            st.image(image, caption='Uploaded Image', use_container_width=True)
-        
-        with col2:
-            st.write("### Analysis Results")
+            pred = classify_region(region)
+            if pred is None:
+                continue
 
-            probability = predict_with_interpreter(models['barren'], image, is_binary=True, normalize=False)
+            crop, conf = pred
 
-            if probability > 0.5:
-                is_barren = False
-                st.success(f"✅ **Land Status:** Non-Barren (Crop Detected)")
-                st.caption(f"Barren Confidence: {probability*100:.1f}%") 
-            else:
-                # IT IS BARREN
-                is_barren = True
-                conf = 1.0 - probability
-                st.error(f"🟫 **Result: Barren Land Detected**")
-                st.write(f"Confidence: {conf*100:.1f}%")
-                st.warning("Analysis stopped.")
-
-            if not is_barren:
-
-                preds_main = predict_with_interpreter(models['main'], image, normalize=True)
-                crop_idx = np.argmax(preds_main)
-                crop_conf = np.max(preds_main) * 100
-                detected_crop = LABELS_5_CROPS.get(crop_idx, "Unknown")
-                
-                st.info(f"**Identified Crop:** {detected_crop} ({crop_conf:.1f}%)")
-                
-                with st.expander("See Probabilities"):
-                    st.bar_chart({label: float(preds_main[idx]) for idx, label in LABELS_5_CROPS.items()})
-
-                # STAGE DETECTION
-                if detected_crop == "Maize" and models['maize']:
-                    st.markdown("---")
-                    preds_stage = predict_with_interpreter(models['maize'], image, normalize=True)
-                    stage_idx = np.argmax(preds_stage)
-                    detected_stage = LABELS_MAIZE_STAGE.get(stage_idx, "Unknown")
-                    estimated_age = AGE_ESTIMATES['Maize'].get(detected_stage, "Unknown")
-                    
-                    c1, c2 = st.columns(2)
-                    c1.metric("Growth Phase", detected_stage)
-                    c2.metric("Est. Age", estimated_age)
-                
-                elif detected_crop == "Wheat" and models['wheat']:
-                    st.markdown("---")
-                    preds_stage = predict_with_interpreter(models['wheat'], image, normalize=True)
-                    stage_idx = np.argmax(preds_stage)
-                    detected_stage = LABELS_WHEAT_STAGE.get(stage_idx, "Unknown")
-                    estimated_age = AGE_ESTIMATES['Wheat'].get(detected_stage, "Unknown")
-                    
-                    c1, c2 = st.columns(2)
-                    c1.metric("Growth Phase", detected_stage)
-                    c2.metric("Est. Age", estimated_age)
-                
-                elif detected_crop in ["Mustard", "Rice", "Sugarcane"]:
-                    st.markdown("---")
-                    st.caption(f"ℹ️ Stage detection for **{detected_crop}** coming soon.")
-
-# BATCH PROCESSING LOGIC 
-
-elif mode == "Batch Processing (Bulk)":
-    st.title("📂 Batch Processing")
-    uploaded_files = st.file_uploader("Choose images...", type=["jpg", "png", "jpeg"], accept_multiple_files=True)
-
-    if uploaded_files and st.button("Start Processing"):
-        results = []
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        
-        counts = {'Barren': 0, 'Maize': 0, 'Wheat': 0, 'Mustard': 0, 'Rice': 0, 'Sugarcane': 0}
-        
-        for i, uploaded_file in enumerate(uploaded_files):
-            status_text.text(f"Processing image {i+1} of {len(uploaded_files)}...")
-            progress_bar.progress((i + 1) / len(uploaded_files))
-            
-            try:
-                image = Image.open(uploaded_file).convert('RGB')
-
-                prob = predict_with_interpreter(models['barren'], image, is_binary=True, normalize=False)
-                
-                if prob <= 0.5: 
-                    counts['Barren'] += 1
-                    results.append({
-                        "Filename": uploaded_file.name, "Status": "Barren Land",
-                        "Crop": "N/A", "Confidence": f"{(1-prob)*100:.1f}%"
-                    })
-                    continue 
-
-                preds = predict_with_interpreter(models['main'], image, normalize=True)
-                crop_idx = np.argmax(preds)
-                crop_conf = np.max(preds) * 100
-                detected_crop = LABELS_5_CROPS.get(crop_idx, "Unknown")
-                
-                if detected_crop in counts: counts[detected_crop] += 1
-
-                detected_stage = "N/A"
-                est_age = "N/A"
-                
-                if detected_crop == "Maize" and models['maize']:
-                    s_preds = predict_with_interpreter(models['maize'], image, normalize=True)
-                    detected_stage = LABELS_MAIZE_STAGE.get(np.argmax(s_preds), "Unknown")
-                    est_age = AGE_ESTIMATES['Maize'].get(detected_stage, "Unknown")
-                elif detected_crop == "Wheat" and models['wheat']:
-                    s_preds = predict_with_interpreter(models['wheat'], image, normalize=True)
-                    detected_stage = LABELS_WHEAT_STAGE.get(np.argmax(s_preds), "Unknown")
-                    est_age = AGE_ESTIMATES['Wheat'].get(detected_stage, "Unknown")
-                
-                results.append({
-                    "Filename": uploaded_file.name, "Status": "Cultivated",
-                    "Crop": detected_crop, "Confidence": f"{crop_conf:.1f}%",
-                    "Stage": detected_stage, "Age": est_age
+            if conf >= CONF_THRESH:
+                detections.append({
+                    "crop": crop,
+                    "conf": conf,
+                    "bbox": (x1, y1, x2, y2)
                 })
-                
-            except Exception as e:
-                 results.append({"Filename": uploaded_file.name, "Status": "Error", "Crop": str(e)})
 
-        progress_bar.empty()
-        status_text.success("✅ Complete!")
-        
-        st.write("### 📊 Summary")
-        cols = st.columns(len(counts))
-        for idx, (key, val) in enumerate(counts.items()):
-            cols[idx].metric(key, val)
-        
-        st.write("### 📝 Logs")
-        st.dataframe(pd.DataFrame(results), use_container_width=True)
+    return detections
+
+# =====================================================
+# DRAW
+# =====================================================
+def draw_boxes(image, detections):
+    img = image.copy()
+    draw = ImageDraw.Draw(img)
+
+    for d in detections:
+        x1, y1, x2, y2 = d["bbox"]
+        color = COLORS.get(d["crop"], "white")
+        label = f"{d['crop']} {int(d['conf']*100)}%"
+
+        draw.rectangle([x1, y1, x2, y2], outline=color, width=4)
+        draw.text((x1 + 5, y1 + 5), label, fill=color)
+
+    return img
+
+# =====================================================
+# STREAMLIT UI
+# =====================================================
+st.set_page_config(layout="wide")
+st.title(" Multi-Crop Detection — 3-Pass Ensemble System")
+
+uploaded = st.file_uploader("Upload field image", type=["jpg", "jpeg", "png"])
+
+if uploaded:
+    image_pil = Image.open(uploaded).convert("RGB")
+    image_np = np.array(image_pil)
+
+    st.image(image_pil, caption="Original Image", width="stretch")
+
+    with st.spinner("Running full ensemble inference..."):
+        barren_result, full_crop = classify_full_image(image_np)
+
+        grid_aligned = run_grid(image_np, 0.0, 0.0)
+        grid_offset = run_grid(image_np, 0.5, 0.5)
+
+        all_dets = grid_aligned + grid_offset
+
+        votes = defaultdict(list)
+        for d in all_dets:
+            votes[d["crop"]].append(d)
+
+        print("\n================ ENSEMBLE DEBUG =================")
+        final = []
+
+        for crop, items in votes.items():
+            avg_conf = np.mean([i["conf"] for i in items])
+            vote_count = len(items)
+
+            print(f"{crop}:")
+            for i in items:
+                print(f"   conf={i['conf']:.3f} bbox={i['bbox']}")
+            print(f"   TOTAL VOTES = {vote_count}")
+            print(f"   AVG CONF    = {avg_conf:.3f}\n")
+
+            is_full_prior = full_crop and crop == full_crop["crop"]
+
+            vote_req = 2 if is_full_prior else VOTE_THRESH
+            conf_req = 0.60 if is_full_prior else CONF_THRESH
+
+            if vote_count >= vote_req and avg_conf >= conf_req or (vote_count >= 1 and avg_conf >= 0.99):
+                xs = [(b["bbox"][0] + b["bbox"][2]) / 2 for b in items]
+                ys = [(b["bbox"][1] + b["bbox"][3]) / 2 for b in items]
+
+                cx, cy = int(np.mean(xs)), int(np.mean(ys))
+
+                location = (
+                    "top" if cy < image_np.shape[0]/3 else
+                    "center" if cy < image_np.shape[0]*2/3 else
+                    "bottom"
+                )
+                
+
+                final.append({
+                    "Crop": crop,
+                    "Votes": vote_count,
+                    "Avg Confidence (%)": round(avg_conf * 100, 2),
+                    "Location": location,
+                    "Source": "full-image-prior" if is_full_prior else "grid-consensus",
+                    "Full Crop Result": full_crop["crop"]
+                })
+
+# =====================================================
+        if full_crop is not None:
+            full_crop_name = full_crop["crop"]
+            final_crops = [item["Crop"] for item in final]
+
+            if full_crop_name not in final_crops:
+                print("\n⚠️ FULL IMAGE CROP NOT PRESENT IN ENSEMBLE")
+                print("➡️ Replacing ensemble output with full-image result")
+
+                final = [{
+                    "Crop": full_crop_name,
+                    "Votes": "FULL",
+                    "Avg Confidence (%)": round(full_crop["confidence"] * 100, 2),
+                    "Location": "entire_field",
+                    "Source": "full-image-override"
+                }]               
+# =====================================================
+# =====================================================
+# FALLBACK: FULL IMAGE CROP IF ENSEMBLE FAILS
+# =====================================================
+        if not final and full_crop is not None:
+            print("\n ENSEMBLE EMPTY — FALLING BACK TO FULL IMAGE PREDICTION")
+
+            final.append({
+                "Crop": full_crop["crop"],
+                "Votes": "FULL",
+                "Avg Confidence (%)": round(full_crop["confidence"] * 100, 2),
+                "Location": "entire_field",
+                "Source": "full-image-fallback"
+            })
+    # ================= VISUAL =================
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.subheader("Pass 2 — Aligned Grid")
+        st.image(draw_boxes(image_pil, grid_aligned), width="stretch")
+
+    with col2:
+        st.subheader("Pass 3 — Offset Grid")
+        st.image(draw_boxes(image_pil, grid_offset), width="stretch")
+
+    st.subheader(" Full Image Barren Detection")
+    if not barren_result["is_crop"]:
+        st.error(f"Barren Land ({barren_result['confidence']*100:.1f}%)")
+    else:
+        st.success(f"Non-Barren Field ({barren_result['confidence']*100:.1f}%)")
+
+    st.subheader(" Final Ensemble Output")
+    if final:
+        st.dataframe(pd.DataFrame(final), use_container_width=True)
+    else:
+        st.warning("No crop satisfied ensemble conditions.")
